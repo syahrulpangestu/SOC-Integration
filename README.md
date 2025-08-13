@@ -1,6 +1,6 @@
-# Wazuh---MISP-Integration
-Wazuh &amp; MISP Integration for IoC 
+
 # Wazuh ↔ MISP Integration Script
+Wazuh &amp; MISP Integration for IoC 
 
 ## Overview
 This script enables integration between **Wazuh** (SIEM) and **MISP** (Malware Information Sharing Platform) to:

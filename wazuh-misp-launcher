@@ -1,0 +1,40 @@
+#!/bin/sh
+# Wazuh → MISP integration launcher
+# Runs the Python script companion (same basename + ".py")
+# Compatible with integrations/, active-response/bin, wodles/* and bin/
+
+set -eu
+
+WPYTHON_BIN="framework/python/bin/python3"
+
+SCRIPT_PATH_NAME="$0"
+DIR_NAME="$(cd "$(dirname "$SCRIPT_PATH_NAME")"; pwd -P)"
+SCRIPT_NAME="$(basename "$SCRIPT_PATH_NAME")"
+
+case "$DIR_NAME" in
+  */active-response/bin|*/wodles*)
+    : "${WAZUH_PATH:="$(cd "$DIR_NAME/../.."; pwd)"}"
+    PYTHON_SCRIPT="${DIR_NAME}/${SCRIPT_NAME}.py"
+    ;;
+  */bin)
+    : "${WAZUH_PATH:="$(cd "$DIR_NAME/.."; pwd)"}"
+    PYTHON_SCRIPT="${WAZUH_PATH}/framework/scripts/$(echo "$SCRIPT_NAME" | sed 's/-/_/g').py"
+    ;;
+  */integrations)
+    : "${WAZUH_PATH:="$(cd "$DIR_NAME/.."; pwd)"}"
+    PYTHON_SCRIPT="${DIR_NAME}/${SCRIPT_NAME}.py"
+    ;;
+  *)
+    : "${WAZUH_PATH:="$(cd "$DIR_NAME/.."; pwd)"}"
+    PYTHON_SCRIPT="${DIR_NAME}/${SCRIPT_NAME}.py"
+    ;;
+esac
+
+# Prefer Wazuh embedded Python; fall back to system python3 if missing
+if [ -x "${WAZUH_PATH}/${WPYTHON_BIN}" ]; then
+  PYTHON_BIN="${WAZUH_PATH}/${WPYTHON_BIN}"
+else
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+exec "$PYTHON_BIN" "$PYTHON_SCRIPT" "$@"

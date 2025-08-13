@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+- Secure TLS (verify/CA), retry+timeout
+- POST /attributes/restSearch (JSON body)
+- Multi-match output, deep-merge, SHA-256/IP validation
+"""
+
+import os, sys, json, re, ipaddress, logging
+from socket import socket, AF_UNIX, SOCK_DGRAM
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+# ---------------- Configuration via environment ----------------
+MISP_URL     = os.getenv("MISP_URL", "https://misp.example.com/attributes/restSearch")
+MISP_KEY     = os.getenv("MISP_KEY", "CHANGE_ME")
+# MISP_VERIFY: "true"|"false" (case-insensitive). If you want to use a CA bundle, set MISP_CA and keep VERIFY=true
+MISP_VERIFY  = os.getenv("MISP_VERIFY", "true").lower() == "true"
+MISP_CA      = os.getenv("MISP_CA", "") or None
+TIMEOUT      = float(os.getenv("MISP_TIMEOUT", "8"))
+LIMIT        = int(os.getenv("MISP_LIMIT", "50"))  # max attributes returned
+LOG_LEVEL    = os.getenv("MISP_LOGLEVEL", "INFO").upper()
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s: %(message)s")
+
+# ---------------- Wazuh queue socket ----------------
+PWD = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SOCKET_ADDR = f"{PWD}/queue/sockets/queue"
+
+def send_event(msg, agent=None):
+    """Send an event to the Wazuh queue socket."""
+    try:
+        if not agent or agent.get("id") == "000":
+            payload = f'1:misp:{json.dumps(msg, ensure_ascii=False)}'
+        else:
+            src_ip = agent.get("ip", "any")
+            payload = f'1:[{agent["id"]}] ({agent["name"]}) {src_ip}->misp:{json.dumps(msg, ensure_ascii=False)}'
+        sock = socket(AF_UNIX, SOCK_DGRAM)
+        sock.connect(SOCKET_ADDR)
+        sock.send(payload.encode())
+        sock.close()
+    except Exception as e:
+        logging.error(f"Failed to send event to Wazuh queue: {e}")
+
+# ---------------- Helpers ----------------
+RX_SHA256 = re.compile(r'(?i)\b[a-f0-9]{64}\b')
+
+def is_global_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except Exception:
+        return False
+
+def deep_merge(base: dict, extra: dict) -> dict:
+    """Shallow + inner merge for 'misp' key to avoid overwriting."""
+    out = dict(base or {})
+    for k, v in (extra or {}).items():
+        if k == "misp" and isinstance(v, dict):
+            out.setdefault("misp", {})
+            out["misp"].update(v)
+        else:
+            out[k] = v
+    return out
+
+def append_ip_list(ip, path="/var/ossec/etc/lists/misp_ip_lists.txt"):
+    """Append unique, global IPs to a list file."""
+    try:
+        if not ip or not is_global_ip(ip):
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        existing = set()
+        if os.path.exists(path):
+            with open(path) as f:
+                existing = {l.strip() for l in f if l.strip()}
+        if ip not in existing:
+            with open(path, "a") as f:
+                f.write(ip + "\n")
+    except Exception as e:
+        logging.warning(f"Failed to append IP list: {e}")
+
+def build_session() -> requests.Session:
+    """HTTP session with retry/backoff and default headers."""
+    s = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.headers.update({"Content-Type": "application/json", "Authorization": MISP_KEY, "Accept": "application/json"})
+    return s
+
+def misp_rest_search(session: requests.Session, value: str) -> dict:
+    """POST MISP /attributes/restSearch with a simple filter."""
+    verify_opt = MISP_CA if (MISP_VERIFY and MISP_CA) else MISP_VERIFY
+    body = {"value": value, "to_ids": True, "limit": LIMIT}
+    logging.debug(f"MISP request body={body}")
+    r = session.post(MISP_URL, json=body, timeout=TIMEOUT, verify=verify_opt)
+    r.raise_for_status()
+    return r.json()
+
+def extract_indicator(alert: dict):
+    """Extract an IOC from common Wazuh alert shapes with safe access."""
+    groups = alert.get("rule", {}).get("groups", [])
+    event_source = groups[0] if len(groups) > 0 else ""
+    event_type   = groups[2] if len(groups) > 2 else ""
+    decoder_name = alert.get("decoder", {}).get("name", "")
+
+    # Windows Sysmon
+    if event_source == "windows":
+        win = alert.get("data", {}).get("win", {}).get("eventdata", {})
+        # Hash-based events
+        if event_type in {"sysmon_event1","sysmon_event6","sysmon_event7","sysmon_event_15",
+                          "sysmon_event_23","sysmon_event_24","sysmon_event_25"}:
+            hashes = (win.get("hashes") or "")
+            m = RX_SHA256.search(hashes)
+            return m.group(0) if m else None
+        # Network connection
+        if event_type == "sysmon_event3":
+            if win.get("destinationIsIpv6") == "false":
+                ip = win.get("destinationIp")
+                return ip if is_global_ip(ip) else None
+            return None
+        # DNS query
+        if event_type == "sysmon_event_22":
+            return win.get("queryName")
+        return None
+
+    # Linux (Sysmon for Linux)
+    if event_source == "linux":
+        ev = alert.get("data", {}).get("eventdata", {})
+        if event_type == "sysmon_event3" and ev.get("destinationIsIpv6") == "false":
+            ip = ev.get("DestinationIp")
+            return ip if is_global_ip(ip) else None
+        if event_type == "sysmon_event1" and ev.get("commandLineCommand") in {"nslookup", "ping"}:
+            return ev.get("commandLineParameter")
+        return None
+
+    # Wazuh syscheck
+    if event_source == "syscheck" and decoder_name in {"syscheck_new_entry","syscheck_integrity_changed"}:
+        return alert.get("syscheck", {}).get("sha256_after") or alert.get("syscheck", {}).get("md5_after")
+
+    # OSSEC generic syscheck
+    if event_source == "ossec" and event_type in {"syscheck_entry_added","syscheck_entry_modified"}:
+        return alert.get("syscheck", {}).get("sha256_after") or alert.get("syscheck", {}).get("md5_after")
+
+    # Web/Syslog sources (use srcip)
+    if event_source == "web" and event_type in {"web_scan","attack"}:
+        return alert.get("data", {}).get("srcip")
+    if event_source == "syslog" and event_type == "authentication_failed":
+        return alert.get("data", {}).get("srcip")
+
+    return None
+
+def base_output(alert: dict) -> dict:
+    """Base output envelope to keep messages consistent."""
+    return {
+        "integration": "misp",
+        "misp": {
+            "source": {
+                "description": alert.get("rule", {}).get("description", "Event matched MISP integration")
+            }
+        }
+    }
+
+def process_and_send(alert: dict, value: str, extra_fields: dict = None, ip_list_path: str = None):
+    """Query MISP, build output with multi-match, and send to Wazuh."""
+    session = build_session()
+    try:
+        res = misp_rest_search(session, value)
+    except Exception as e:
+        send_event({"integration":"misp","misp":{"error":f"MISP API error: {e}", "searched": value}}, alert.get("agent"))
+        return
+
+    attrs = res.get("response", {}).get("Attribute", [])
+    if not attrs:
+        logging.debug("MISP returned zero attributes for the given indicator.")
+        return
+
+    out = base_output(alert)
+    out["misp"]["matches"] = [{
+        "event_id": a.get("event_id"),
+        "category": a.get("category"),
+        "type": a.get("type"),
+        "value": a.get("value"),
+        "tags": [t.get("name") for t in a.get("Tag", [])] if a.get("Tag") else []
+    } for a in attrs[:LIMIT]]
+
+    if extra_fields:
+        out = deep_merge(out, extra_fields)
+
+    # Optionally persist the src IP for downstream actions
+    if ip_list_path and value and is_global_ip(value):
+        append_ip_list(value, ip_list_path)
+
+    send_event(out, alert.get("agent"))
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    try:
+        with open(sys.argv[1]) as f:
+            alert = json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to read alert file: {e}")
+        sys.exit(0)
+
+    ioc = extract_indicator(alert)
+    if not ioc:
+        logging.debug("No usable indicator was found in this alert.")
+        sys.exit(0)
+
+    extra = {}
+    groups = alert.get("rule", {}).get("groups", [])
+    event_source = groups[0] if len(groups) > 0 else ""
+    event_type   = groups[2] if len(groups) > 2 else ""
+    ip_list_path = None
+
+    # If the event is from web/syslog, keep srcip in the output and a local list (optional)
+    if event_source in {"web","syslog"} and event_type in {"web_scan","attack","authentication_failed"}:
+        extra = {"srcip": alert.get("data", {}).get("srcip")}
+        ip_list_path = "/var/ossec/etc/lists/misp_ip_lists.txt"
+
+    process_and_send(alert, ioc, extra_fields=extra, ip_list_path=ip_list_path)
